@@ -5,7 +5,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
@@ -29,9 +31,12 @@ import top.nkbe.npatch.ui.viewmodel.NewPatchViewModel.PatchState
 import top.nkbe.npatch.ui.viewmodel.NewPatchViewModel.ViewAction
 import top.nkbe.npatch.ui.page.SelectAppsResult
 import io.github.suqi8.coui.kmp.basic.COUIScrollBehavior
+import io.github.suqi8.coui.kmp.basic.InfiniteProgressIndicator
 import io.github.suqi8.coui.kmp.layout.DialogButtonBar
 import io.github.suqi8.coui.kmp.layout.DialogButtonBarAction
 import io.github.suqi8.coui.kmp.overlay.OverlayDialog
+import io.github.suqi8.coui.kmp.overlay.OverlayLoadingDialog
+import io.github.suqi8.coui.kmp.theme.COUITheme
 
 const val ACTION_STORAGE = 0
 const val ACTION_APPLIST = 1
@@ -51,6 +56,24 @@ fun NewPatchScreen(
     val scope = rememberCoroutineScope()
     val errorUnknown = stringResource(R.string.error_unknown)
     val showSelectModuleDialog = remember { mutableStateOf(false) }
+    var pendingPatchedApp by remember { mutableStateOf<nkbe.util.NeoPackageManager.AppInfo?>(null) }
+    var isExtracting by remember { mutableStateOf(false) }
+    var isAnalyzing by remember { mutableStateOf(false) }
+    var missingOriginalDialog by remember { mutableStateOf<nkbe.util.NeoPackageManager.AppInfo?>(null) }
+    var packageMismatchDialog by remember { mutableStateOf<Pair<nkbe.util.NeoPackageManager.AppInfo, nkbe.util.NeoPackageManager.ExtractResult.PackageMismatch>?>(null) }
+
+    fun handleAppSelected(app: nkbe.util.NeoPackageManager.AppInfo) {
+        var patchedType = app.patchedType
+        if (patchedType == nkbe.util.NeoPackageManager.PatchedType.NONE) {
+            patchedType = NeoPackageManager.detectPatchedTypeDeep(app)
+        }
+        if (patchedType != nkbe.util.NeoPackageManager.PatchedType.NONE) {
+            pendingPatchedApp = app
+        } else {
+            viewModel.dispatch(ViewAction.ConfigurePatch(app))
+        }
+    }
+
     val apkMimeTypes = arrayOf(
         "application/vnd.android.package-archive",
         "application/zip",
@@ -66,12 +89,17 @@ fun NewPatchScreen(
             return@rememberLauncherForActivityResult
         }
         scope.launch {
+            isAnalyzing = true
             NeoPackageManager.getAppInfoFromApks(apks)
                 .onSuccess {
-                    viewModel.dispatch(ViewAction.ConfigurePatch(it.first()))
+                    isAnalyzing = false
+                    handleAppSelected(it.first())
                 }
-                .onFailure {
-                    snackbarHost.showSnackbar(it.message ?: errorUnknown)
+                .onFailure { error ->
+                    isAnalyzing = false
+                    activityScope.launch {
+                        snackbarHost.showSnackbar(error.localizedMessage ?: error.message ?: errorUnknown)
+                    }
                     viewModel.reset()
                     navigator.pop()
                 }
@@ -95,7 +123,7 @@ fun NewPatchScreen(
                         navigator.pop()
                     } else {
                         val singleApp = result as SelectAppsResult.SingleApp
-                        viewModel.dispatch(ViewAction.ConfigurePatch(singleApp.selected))
+                        handleAppSelected(singleApp.selected)
                     }
                 }
                 viewModel.dispatch(ViewAction.DoneInit)
@@ -104,10 +132,15 @@ fun NewPatchScreen(
                 data?.let { dataStr ->
                     val uri = dataStr.toUri()
                     scope.launch {
+                        isAnalyzing = true
                         NeoPackageManager.getAppInfoFromApks(listOf(uri)).onSuccess {
-                            viewModel.dispatch(ViewAction.ConfigurePatch(it.first()))
-                        }.onFailure {
-                            snackbarHost.showSnackbar(it.message ?: errorUnknown)
+                            isAnalyzing = false
+                            handleAppSelected(it.first())
+                        }.onFailure { error ->
+                            isAnalyzing = false
+                            activityScope.launch {
+                                snackbarHost.showSnackbar(error.localizedMessage ?: error.message ?: errorUnknown)
+                            }
                             viewModel.reset()
                             navigator.pop()
                         }
@@ -150,8 +183,8 @@ fun NewPatchScreen(
         }
     ) { innerPadding ->
         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
-            when (viewModel.patchState) {
-                PatchState.CONFIGURING -> {
+            when {
+                viewModel.patchState == PatchState.CONFIGURING -> {
                     PatchOptionsBody(
                         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
                         onAddEmbed = {
@@ -159,10 +192,28 @@ fun NewPatchScreen(
                         }
                     )
                 }
-                PatchState.PATCHING,
-                PatchState.FINISHED,
-                PatchState.ERROR -> {
+                viewModel.patchState in listOf(PatchState.PATCHING, PatchState.FINISHED, PatchState.ERROR) -> {
                     DoPatchBody(modifier = Modifier, navigator = navigator)
+                }
+                isAnalyzing || viewModel.patchState == PatchState.SELECTING -> {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier.padding(24.dp)
+                        ) {
+                            InfiniteProgressIndicator()
+                            Spacer(Modifier.height(16.dp))
+                            Text(
+                                text = stringResource(R.string.manage_loading),
+                                style = COUITheme.textStyles.body2,
+                                color = COUITheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
                 }
                 else -> {}
             }
@@ -193,6 +244,158 @@ fun NewPatchScreen(
                         onClick = { showSelectModuleDialog.value = false },
                     ),
                 )
+            }
+
+            pendingPatchedApp?.let { app ->
+                val patchedType = NeoPackageManager.detectPatchedTypeDeep(app)
+                val typeName = if (patchedType != NeoPackageManager.PatchedType.NONE) patchedType.displayName else "NPatch/LSPatch/FPA"
+                OverlayDialog(
+                    title = stringResource(R.string.patch_extract_original_title, typeName),
+                    summary = stringResource(R.string.patch_extract_original_text, typeName),
+                    show = pendingPatchedApp != null && !isExtracting,
+                    onDismissRequest = {
+                        pendingPatchedApp = null
+                        viewModel.reset()
+                        navigator.pop()
+                    },
+                    renderInRootScaffold = false,
+                ) {
+                    DialogButtonBar(
+                        positive = DialogButtonBarAction(
+                            text = stringResource(R.string.patch_extract_original_confirm),
+                            onClick = {
+                                isExtracting = true
+                                scope.launch {
+                                    when (val result = NeoPackageManager.extractOriginalApk(app)) {
+                                        is NeoPackageManager.ExtractResult.Success -> {
+                                            isExtracting = false
+                                            pendingPatchedApp = null
+                                            viewModel.dispatch(ViewAction.ConfigurePatch(result.originalAppInfo))
+                                        }
+                                        is NeoPackageManager.ExtractResult.NoOriginalApk -> {
+                                            isExtracting = false
+                                            pendingPatchedApp = null
+                                            missingOriginalDialog = app
+                                        }
+                                        is NeoPackageManager.ExtractResult.PackageMismatch -> {
+                                            isExtracting = false
+                                            pendingPatchedApp = null
+                                            packageMismatchDialog = app to result
+                                        }
+                                        is NeoPackageManager.ExtractResult.Corrupted -> {
+                                            isExtracting = false
+                                            pendingPatchedApp = null
+                                            snackbarHost.showSnackbar(result.message)
+                                            viewModel.reset()
+                                            navigator.pop()
+                                        }
+                                        is NeoPackageManager.ExtractResult.Error -> {
+                                            isExtracting = false
+                                            pendingPatchedApp = null
+                                            snackbarHost.showSnackbar(result.message)
+                                            viewModel.reset()
+                                            navigator.pop()
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        neutral = DialogButtonBarAction(
+                            text = stringResource(R.string.patch_extract_original_direct),
+                            onClick = {
+                                pendingPatchedApp = null
+                                viewModel.dispatch(ViewAction.ConfigurePatch(app))
+                            }
+                        ),
+                        negative = DialogButtonBarAction(
+                            text = stringResource(android.R.string.cancel),
+                            onClick = {
+                                pendingPatchedApp = null
+                                viewModel.reset()
+                                navigator.pop()
+                            }
+                        ),
+                    )
+                }
+            }
+
+            if (isExtracting) {
+                OverlayLoadingDialog(
+                    text = stringResource(R.string.patch_extract_original_extracting),
+                    show = isExtracting,
+                    onDismissRequest = { isExtracting = false }
+                )
+            }
+
+            missingOriginalDialog?.let { app ->
+                OverlayDialog(
+                    title = stringResource(R.string.patch_extract_original_title, app.label),
+                    summary = stringResource(R.string.patch_extract_original_missing),
+                    show = missingOriginalDialog != null,
+                    onDismissRequest = {
+                        missingOriginalDialog = null
+                        viewModel.reset()
+                        navigator.pop()
+                    },
+                    renderInRootScaffold = false,
+                ) {
+                    DialogButtonBar(
+                        positive = DialogButtonBarAction(
+                            text = stringResource(R.string.patch_extract_original_direct),
+                            onClick = {
+                                missingOriginalDialog = null
+                                viewModel.dispatch(ViewAction.ConfigurePatch(app))
+                            }
+                        ),
+                        negative = DialogButtonBarAction(
+                            text = stringResource(android.R.string.cancel),
+                            onClick = {
+                                missingOriginalDialog = null
+                                viewModel.reset()
+                                navigator.pop()
+                            }
+                        ),
+                    )
+                }
+            }
+
+            packageMismatchDialog?.let { (app, mismatch) ->
+                OverlayDialog(
+                    title = stringResource(R.string.patch_extract_original_title, app.label),
+                    summary = stringResource(R.string.patch_extract_package_mismatch, mismatch.outerPkg, mismatch.innerPkg),
+                    show = packageMismatchDialog != null,
+                    onDismissRequest = {
+                        packageMismatchDialog = null
+                        viewModel.reset()
+                        navigator.pop()
+                    },
+                    renderInRootScaffold = false,
+                ) {
+                    DialogButtonBar(
+                        positive = DialogButtonBarAction(
+                            text = stringResource(R.string.patch_extract_original_confirm),
+                            onClick = {
+                                packageMismatchDialog = null
+                                viewModel.dispatch(ViewAction.ConfigurePatch(mismatch.originalAppInfo))
+                            }
+                        ),
+                        neutral = DialogButtonBarAction(
+                            text = stringResource(R.string.patch_extract_original_direct),
+                            onClick = {
+                                packageMismatchDialog = null
+                                viewModel.dispatch(ViewAction.ConfigurePatch(app))
+                            }
+                        ),
+                        negative = DialogButtonBarAction(
+                            text = stringResource(android.R.string.cancel),
+                            onClick = {
+                                packageMismatchDialog = null
+                                viewModel.reset()
+                                navigator.pop()
+                            }
+                        ),
+                    )
+                }
             }
         }
     }

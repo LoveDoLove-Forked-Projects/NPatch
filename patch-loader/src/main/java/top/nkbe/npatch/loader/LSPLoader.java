@@ -39,9 +39,11 @@ import org.matrix.vector.ipc.IModuleService;
 import org.matrix.vector.ipc.IFrameworkService;
 import org.matrix.vector.ipc.IProcessChannel;
 import org.matrix.vector.ipc.IRemotePreferenceCallback;
+import org.matrix.vector.Startup;
 import org.matrix.vector.impl.VectorContext;
 import org.matrix.vector.impl.VectorLifecycleManager;
 import org.matrix.vector.impl.core.VectorServiceClient;
+import top.nkbe.npatch.share.LSPConfig;
 import org.matrix.vector.nativebridge.NativeAPI;
 
 public class LSPLoader {
@@ -62,9 +64,17 @@ public class LSPLoader {
     }
 
     public static void initModules(LoadedApk loadedApk) {
+        String ver = LSPConfig.instance.VERSION_NAME;
+        XposedBridge.FRAMEWORK_NAME = "NPatch";
+        XposedBridge.FRAMEWORK_VERSION = ver.startsWith("v") ? ver : "v" + ver;
+        XposedBridge.FRAMEWORK_VERSION_NAME = XposedBridge.FRAMEWORK_VERSION;
+        XposedBridge.FRAMEWORK_VERSION_CODE = LSPConfig.instance.VERSION_CODE;
+        XposedBridge.XPOSED_BRIDGE_VERSION = 93;
+
         installNativeModuleServiceProxy();
         registerModuleRuntimeAppInfos();
         installModuleSelfPathCompatibility();
+        Startup.trackLoadedApk(loadedApk);
         XposedInit.loadModules(ActivityThread.currentActivityThread());
         ApplicationInfo moduleCompatibleAppInfo =
                 SigBypass.createModuleCompatibleApplicationInfo(loadedApk.getApplicationInfo());
@@ -497,20 +507,32 @@ public class LSPLoader {
                     ? moduleCompatibleAppInfo
                     : loadedApk.getApplicationInfo();
             ClassLoader classLoader = loadedApk.getClassLoader();
+            ClassLoader defaultClassLoader = null;
+            try {
+                defaultClassLoader = (ClassLoader) XposedHelpers.getObjectField(loadedApk, "mDefaultClassLoader");
+            } catch (Throwable ignored) {
+            }
+            if (defaultClassLoader == null) {
+                defaultClassLoader = classLoader;
+            }
             Object appComponentFactory = createAppComponentFactory(appInfo, classLoader);
 
-            VectorLifecycleManager.INSTANCE.dispatchPackageLoaded(
-                    packageName,
-                    appInfo,
-                    true,
-                    classLoader);
-            VectorLifecycleManager.INSTANCE.dispatchPackageReady(
-                    packageName,
-                    appInfo,
-                    true,
-                    classLoader,
-                    classLoader,
-                    appComponentFactory);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                VectorLifecycleManager.INSTANCE.dispatchPackageLoaded(
+                        packageName,
+                        appInfo,
+                        true,
+                        defaultClassLoader);
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                VectorLifecycleManager.INSTANCE.dispatchPackageReady(
+                        packageName,
+                        appInfo,
+                        true,
+                        defaultClassLoader,
+                        classLoader,
+                        appComponentFactory);
+            }
         } catch (Throwable e) {
             Log.e(TAG, "Failed to dispatch modern Xposed lifecycle", e);
         }
